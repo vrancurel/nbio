@@ -153,9 +153,15 @@ func (g *Engine) Stop() {
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
-	g.mux.Unlock()
 
 	g.wgConn.Done()
+
+	// Need to be executed under lock otherwise it races with
+	// deleteConn().
+	//
+	// As a side effect Close can be called multiple times
+	// especially when deleteConn() happens before/after Stop().
+	
 	for c := range conns {
 		if c != nil {
 			cc := c
@@ -172,6 +178,7 @@ func (g *Engine) Stop() {
 			})
 		}
 	}
+	g.mux.Unlock()
 
 	g.wgConn.Wait()
 	time.Sleep(time.Second / 5)

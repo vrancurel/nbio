@@ -65,24 +65,31 @@ type poller struct {
 
 func (p *poller) addConn(c *Conn) {
 	fd := c.fd
+	p.g.mux.Lock()
 	if fd >= len(p.g.connsUnix) {
+		p.g.mux.Unlock()
 		c.closeWithError(fmt.Errorf("too many open files, fd[%d] >= MaxOpenFiles[%d]", fd, len(p.g.connsUnix)))
 		return
 	}
+	p.g.connsUnix[fd] = c
 	c.p = p
+	p.g.mux.Unlock()
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	}
-	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
+		p.g.mux.Lock()
 		p.g.connsUnix[fd] = nil
+		p.g.mux.Unlock()
 		c.closeWithError(err)
 		logging.Error("[%v] add read event failed: %v", c.fd, err)
 	}
 }
 
 func (p *poller) getConn(fd int) *Conn {
+	p.g.mux.Lock()
+	defer p.g.mux.Unlock()
 	return p.g.connsUnix[fd]
 }
 
@@ -93,9 +100,11 @@ func (p *poller) deleteConn(c *Conn) {
 	fd := c.fd
 
 	if c.typ != ConnTypeUDPClientFromRead {
+		p.g.mux.Lock()
 		if c == p.g.connsUnix[fd] {
 			p.g.connsUnix[fd] = nil
 		}
+		p.g.mux.Unlock()
 		p.deleteEvent(fd)
 	}
 
@@ -127,8 +136,16 @@ func (p *poller) acceptorLoop() {
 		defer runtime.UnlockOSThread()
 	}
 
+	p.g.mux.Lock()
 	p.shutdown = false
-	for !p.shutdown {
+	p.g.mux.Unlock()
+	for {
+		p.g.mux.Lock()
+		shutdown := p.shutdown
+		p.g.mux.Unlock()
+		if shutdown {
+			break
+		}
 		conn, err := p.listener.Accept()
 		if err == nil {
 			var c *Conn
@@ -144,7 +161,7 @@ func (p *poller) acceptorLoop() {
 				logging.Error("NBIO[%v][%v_%v] Accept failed: temporary error, retrying...", p.g.Name, p.pollType, p.index)
 				time.Sleep(time.Second / 20)
 			} else {
-				if !p.shutdown {
+				if !shutdown {
 					logging.Error("NBIO[%v][%v_%v] Accept failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
 				}
 				break
@@ -167,8 +184,16 @@ func (p *poller) readWriteLoop() {
 		p.g.maxConnReadTimesPerEventLoop = 1<<31 - 1
 	}
 
+	p.g.mux.Lock()
 	p.shutdown = false
-	for !p.shutdown {
+	p.g.mux.Unlock()
+	for {
+		p.g.mux.Lock()
+		shutdown := p.shutdown
+		p.g.mux.Unlock()
+		if shutdown {
+			break
+		}
 		n, err := syscall.EpollWait(p.epfd, events, msec)
 		if err != nil && !errors.Is(err, syscall.EINTR) {
 			return
@@ -238,7 +263,9 @@ func (p *poller) readWriteLoop() {
 
 func (p *poller) stop() {
 	logging.Debug("NBIO[%v][%v_%v] stop...", p.g.Name, p.pollType, p.index)
+	p.g.mux.Lock()
 	p.shutdown = true
+	p.g.mux.Unlock()
 	if p.listener != nil {
 		p.listener.Close()
 		if p.unixSockAddr != "" {
